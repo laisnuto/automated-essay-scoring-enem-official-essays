@@ -1,0 +1,50 @@
+# Imagens geradas
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+
+# CSVs grandes (descomente se quiser ignorar)
+# *.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Resultados e checkpoints
+results/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+
+# Logs
+*.log
+logs/
+
+# Google Colab
+.drive/
+
