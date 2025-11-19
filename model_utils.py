@@ -9,6 +9,7 @@ from transformers import (
 )
 from torch.cuda.amp import autocast, GradScaler
 import numpy as np
+import pandas as pd
 from typing import Dict, List, Optional, Tuple
 import os
 
@@ -143,13 +144,15 @@ def train_model_cv(
     df_train,
     comp_idx: int,
     hyperparams: Dict,
-    model_name_template: str,
+    model_name_template: Optional[str] = None,
     tokenizer_name: Optional[str] = None,
     cv_folds: Optional[int] = None,
     text_col: str = "texto",
     year_col: str = "ano",
     max_len: int = 512,
-    device: Optional[torch.device] = None
+    device: Optional[torch.device] = None,
+    base_model_name: Optional[str] = None,
+    gradient_clipping: bool = False
 ) -> float:
     """
     Train model with cross-validation for hyperparameter search.
@@ -160,15 +163,35 @@ def train_model_cv(
         device = get_device()
     
     comp_col = f"C{comp_idx}"
-    model_name = model_name_template.format(comp_idx)
     
-    tokenizer, model = load_tokenizer_and_model(
-        model_name,
-        tokenizer_name=tokenizer_name,
-        num_labels=6,
-        device=device,
-        max_len=max_len
-    )
+    # Load tokenizer and model
+    if base_model_name:
+        # For original models, use base model
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+        if hasattr(tokenizer, 'model_max_length') and tokenizer.model_max_length is None:
+            tokenizer.model_max_length = max_len
+        elif hasattr(tokenizer, 'model_max_length') and tokenizer.model_max_length > max_len:
+            tokenizer.model_max_length = max_len
+        model_name = base_model_name
+    else:
+        # For fine-tuned models, use template
+        model_name = model_name_template.format(comp_idx)
+        if tokenizer_name:
+            # Use separate tokenizer (e.g., BERTimbau)
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+            if hasattr(tokenizer, 'model_max_length') and tokenizer.model_max_length is None:
+                tokenizer.model_max_length = max_len
+            elif hasattr(tokenizer, 'model_max_length') and tokenizer.model_max_length > max_len:
+                tokenizer.model_max_length = max_len
+        else:
+            # Use model's tokenizer
+            tokenizer, _ = load_tokenizer_and_model(
+                model_name,
+                tokenizer_name=None,
+                num_labels=6,
+                device=device,
+                max_len=max_len
+            )
     
     unique_years = sorted(df_train[year_col].unique())
     
@@ -217,6 +240,11 @@ def train_model_cv(
                 outputs = model_fold(**batch)
                 loss = criterion(outputs.logits, batch["labels"])
                 loss.backward()
+                
+                # Apply gradient clipping if requested
+                if gradient_clipping:
+                    torch.nn.utils.clip_grad_norm_(model_fold.parameters(), max_norm=1.0)
+                
                 optimizer.step()
         
         model_fold.eval()
@@ -399,3 +427,404 @@ def calculate_expected_grade(
     ).item()
     
     return expected_grade
+
+
+
+
+def run_grid_search_for_competency(
+    df_train,
+    comp_idx: int,
+    hyperparameter_space: Dict[str, List],
+    model_name_template: str,
+    tokenizer_name: Optional[str] = None,
+    year_col: str = "ano",
+    text_col: str = "texto",
+    max_len: int = 512,
+    cv_folds: Optional[int] = None,
+    device: Optional[torch.device] = None,
+    checkpoint_file: Optional[str] = None,
+    best_hyperparams: Optional[Dict] = None,
+    best_qwk_scores: Optional[Dict] = None,
+    use_base_model: bool = False,
+    base_model_name: Optional[str] = None,
+    gradient_clipping: bool = False
+) -> Tuple[Dict, float]:
+    """
+    Run grid search for a single competency.
+    
+    Args:
+        df_train: Training dataframe
+        comp_idx: Competency index (1-5)
+        hyperparameter_space: Dict with lists of values for each hyperparameter
+        model_name_template: Template string for model name (e.g., "model-C{}")
+        tokenizer_name: Optional tokenizer name (if different from model)
+        year_col: Column name for year
+        text_col: Column name for text
+        max_len: Maximum sequence length
+        cv_folds: Number of CV folds (None = use all years)
+        device: PyTorch device
+        checkpoint_file: Path to checkpoint file for saving progress
+        best_hyperparams: Dict to store best hyperparameters (will be updated)
+        best_qwk_scores: Dict to store best QWK scores (will be updated)
+        use_base_model: If True, use base_model_name instead of model_name_template
+        base_model_name: Base model name when use_base_model=True
+        gradient_clipping: Whether to apply gradient clipping
+    
+    Returns:
+        Tuple of (best_hyperparams_dict, best_qwk_score)
+    """
+    import itertools
+    import json
+    
+    if device is None:
+        device = get_device()
+    
+    if best_hyperparams is None:
+        best_hyperparams = {}
+    if best_qwk_scores is None:
+        best_qwk_scores = {}
+    
+    comp_key = f'C{comp_idx}'
+    
+    # Check if already completed
+    if comp_key in best_hyperparams:
+        print(f"{comp_key} already completed. Skipping.")
+        print(f"  Best params: {best_hyperparams[comp_key]}")
+        print(f"  Best QWK: {best_qwk_scores.get(comp_key, 0):.3f}")
+        return best_hyperparams[comp_key], best_qwk_scores.get(comp_key, 0.0)
+    
+    print(f"\n=== Searching hyperparameters for {comp_key} ===")
+    
+    best_qwk = -1
+    best_params = None
+    
+    # Generate all combinations
+    param_combinations = list(itertools.product(*hyperparameter_space.values()))
+    param_names = list(hyperparameter_space.keys())
+    
+    for i, params in enumerate(param_combinations):
+        hyperparams = dict(zip(param_names, params))
+        print(f"\nTrying combination {i+1}/{len(param_combinations)}: {hyperparams}")
+        
+        try:
+            if use_base_model and base_model_name:
+                # For original models, use base model
+                qwk = train_model_cv(
+                    df_train, comp_idx, hyperparams,
+                    model_name_template=None,
+                    tokenizer_name=None,
+                    base_model_name=base_model_name,
+                    year_col=year_col,
+                    text_col=text_col,
+                    max_len=max_len,
+                    cv_folds=cv_folds,
+                    device=device,
+                    gradient_clipping=gradient_clipping
+                )
+            else:
+                qwk = train_model_cv(
+                    df_train, comp_idx, hyperparams,
+                    model_name_template=model_name_template,
+                    tokenizer_name=tokenizer_name,
+                    year_col=year_col,
+                    text_col=text_col,
+                    max_len=max_len,
+                    cv_folds=cv_folds,
+                    device=device,
+                    gradient_clipping=False
+                )
+            
+            if qwk > best_qwk:
+                best_qwk = qwk
+                best_params = hyperparams.copy()
+        
+        except Exception as e:
+            print(f"  Error: {e}")
+            continue
+    
+    best_hyperparams[comp_key] = best_params
+    best_qwk_scores[comp_key] = best_qwk
+    
+    print(f"\nBest hyperparameters for {comp_key}:")
+    print(f"  Params: {best_params}")
+    print(f"  QWK: {best_qwk:.3f}")
+    
+    # Save checkpoint if provided
+    if checkpoint_file:
+        checkpoint_data = {
+            'best_hyperparams': best_hyperparams,
+            'best_qwk_scores': best_qwk_scores
+        }
+        with open(checkpoint_file, 'w') as f:
+            json.dump(checkpoint_data, f, indent=2)
+        print(f"✓ Checkpoint saved to {checkpoint_file}")
+    
+    return best_params, best_qwk
+
+
+def run_grid_search_all_competencies(
+    df_train,
+    hyperparameter_space: Dict[str, List],
+    model_name_template: str,
+    tokenizer_name: Optional[str] = None,
+    competencies: List[int] = [1, 2, 3, 4, 5],
+    year_col: str = "ano",
+    text_col: str = "texto",
+    max_len: int = 512,
+    cv_folds: Optional[int] = None,
+    device: Optional[torch.device] = None,
+    checkpoint_file: Optional[str] = None,
+    use_base_model: bool = False,
+    base_model_name: Optional[str] = None,
+    gradient_clipping: bool = False
+) -> Tuple[Dict, Dict]:
+    """
+    Run grid search for all competencies.
+    
+    Returns:
+        Tuple of (best_hyperparams_dict, best_qwk_scores_dict)
+    """
+    import json
+    
+    if device is None:
+        device = get_device()
+    
+    # Load checkpoint if exists
+    best_hyperparams = {}
+    best_qwk_scores = {}
+    
+    if checkpoint_file and os.path.exists(checkpoint_file):
+        try:
+            with open(checkpoint_file, 'r') as f:
+                checkpoint_data = json.load(f)
+                best_hyperparams = checkpoint_data.get('best_hyperparams', {})
+                best_qwk_scores = checkpoint_data.get('best_qwk_scores', {})
+                print(f"Loaded checkpoint from {checkpoint_file}")
+                print(f"Found saved results for: {list(best_hyperparams.keys())}")
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            best_hyperparams = {}
+            best_qwk_scores = {}
+    
+    # Run grid search for each competency
+    for comp_idx in competencies:
+        run_grid_search_for_competency(
+            df_train, comp_idx, hyperparameter_space,
+            model_name_template, tokenizer_name,
+            year_col=year_col, text_col=text_col, max_len=max_len,
+            cv_folds=cv_folds, device=device,
+            checkpoint_file=checkpoint_file,
+            best_hyperparams=best_hyperparams,
+            best_qwk_scores=best_qwk_scores,
+            use_base_model=use_base_model,
+            base_model_name=base_model_name,
+            gradient_clipping=gradient_clipping
+        )
+    
+    # Save final results
+    if checkpoint_file:
+        checkpoint_data = {
+            'best_hyperparams': best_hyperparams,
+            'best_qwk_scores': best_qwk_scores
+        }
+        with open(checkpoint_file, 'w') as f:
+            json.dump(checkpoint_data, f, indent=2)
+    
+    return best_hyperparams, best_qwk_scores
+
+
+def train_final_models_all_competencies(
+    df_train,
+    best_hyperparams: Dict,
+    model_name_template: str,
+    tokenizer_name: Optional[str] = None,
+    competencies: List[int] = [1, 2, 3, 4, 5],
+    save_dir: Optional[str] = None,
+    model_name_prefix: str = "model",
+    year_col: str = "ano",
+    text_col: str = "texto",
+    max_len: int = 512,
+    device: Optional[torch.device] = None,
+    use_base_model: bool = False,
+    base_model_name: Optional[str] = None
+) -> Tuple[Dict[int, AutoTokenizer], Dict[int, AutoModelForSequenceClassification]]:
+    """
+    Train final models for all competencies using best hyperparameters.
+    
+    Returns:
+        Tuple of (tokenizers_dict, models_dict)
+    """
+    if device is None:
+        device = get_device()
+    
+    tokenizers_final = {}
+    models_final = {}
+    
+    for comp_idx in competencies:
+        comp_key = f'C{comp_idx}'
+        hyperparams = best_hyperparams.get(
+            comp_key,
+            {'learning_rate': 2e-5, 'batch_size': 16, 'epochs': 5}
+        )
+        
+        print(f"\n=== Training Final Model — Competência {comp_key} ===")
+        
+        if save_dir:
+            save_path = os.path.join(save_dir, f"{model_name_prefix}_C{comp_idx}_finetuned_com_redacoes_oficiais")
+        else:
+            save_path = None
+        
+        if use_base_model and base_model_name:
+            # For original models
+            comp_col = f"C{comp_idx}"
+            tokenizer, model = load_tokenizer_and_model(
+                base_model_name,
+                tokenizer_name=base_model_name,
+                num_labels=6,
+                device=device,
+                max_len=max_len
+            )
+            
+            train_ds = EnemCompDataset(
+                df_train, comp_col, tokenizer, for_train=True, max_len=max_len, text_col=text_col
+            )
+            
+            loader_kwargs = dict(
+                batch_size=hyperparams['batch_size'],
+                shuffle=True,
+                num_workers=2,
+                pin_memory=(device.type == "cuda")
+            )
+            train_loader = DataLoader(train_ds, **loader_kwargs)
+            
+            criterion = nn.CrossEntropyLoss()
+            optimizer = torch.optim.AdamW(model.parameters(), lr=hyperparams['learning_rate'])
+            total_steps = max(1, hyperparams['epochs'] * len(train_loader))
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=max(1, int(0.1 * total_steps)),
+                num_training_steps=total_steps
+            )
+            
+            scaler = GradScaler(enabled=(device.type == "cuda"))
+            
+            from tqdm.auto import tqdm
+            import time
+            
+            for ep in range(1, hyperparams['epochs'] + 1):
+                t0 = time.time()
+                model.train()
+                running = 0.0
+                
+                for batch in tqdm(
+                    train_loader,
+                    desc=f"[{comp_key}] Epoch {ep}/{hyperparams['epochs']} (final)",
+                    leave=False
+                ):
+                    batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                    optimizer.zero_grad(set_to_none=True)
+                    
+                    with autocast(enabled=(device.type == "cuda")):
+                        logits = model(**batch).logits
+                        loss = criterion(logits, batch["labels"])
+                    
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    
+                    running += loss.item()
+                
+                train_loss = running / max(1, len(train_loader))
+                print(f"[{comp_key}] epoch {ep}/{hyperparams['epochs']} - train loss: {train_loss:.4f} | tempo: {time.time()-t0:.1f}s")
+                
+                if save_path:
+                    model.save_pretrained(save_path)
+                    tokenizer.save_pretrained(save_path)
+            
+            if save_path:
+                model.save_pretrained(save_path)
+                tokenizer.save_pretrained(save_path)
+                print(f"[{comp_key}] ✓ Modelo final salvo em: {save_path}")
+        else:
+            # For fine-tuned models
+            tok, mdl, _ = train_final_model(
+                df_train, comp_idx, hyperparams,
+                model_name_template=model_name_template,
+                tokenizer_name=tokenizer_name,
+                save_path=save_path,
+                text_col=text_col,
+                max_len=max_len,
+                device=device
+            )
+            tokenizer, model = tok, mdl
+        
+        tokenizers_final[comp_idx] = tokenizer
+        models_final[comp_idx] = model
+    
+    return tokenizers_final, models_final
+
+
+def evaluate_final_models(
+    df_test,
+    tokenizers_final: Dict[int, AutoTokenizer],
+    models_final: Dict[int, AutoModelForSequenceClassification],
+    competencies: List[int] = [1, 2, 3, 4, 5],
+    text_col: str = "texto",
+    max_len: int = 512,
+    batch_size: int = 16,
+    device: Optional[torch.device] = None,
+    save_csv_path: Optional[str] = None,
+    year_col: str = "ano"
+) -> pd.DataFrame:
+    """
+    Evaluate final models on test set and return predictions dataframe.
+    
+    Returns:
+        DataFrame with predictions and ground truth
+    """
+    if device is None:
+        device = get_device()
+    
+    # Prepare test results
+    df_test_final = df_test.reset_index(drop=True).copy()
+    df_test_final["id"] = df_test_final.index
+    
+    # Base CSV structure
+    cols_base = {"id": df_test_final["id"].values}
+    if year_col in df_test_final.columns:
+        cols_base[year_col] = df_test_final[year_col].values
+    out_final = pd.DataFrame(cols_base)
+    
+    # Ground truth scores
+    for c in competencies:
+        out_final[f"C{c}"] = pd.to_numeric(df_test_final[f"C{c}"], errors="coerce").astype("Int64")
+    
+    # Predictions using final models
+    print("\nMaking predictions with final models...")
+    for c in competencies:
+        print(f"Predicting C{c}...")
+        mask_valid = df_test_final[f"C{c}"].notna()
+        preds = pd.Series([pd.NA] * len(df_test_final), dtype="Int64")
+        
+        if mask_valid.any():
+            y_pred = predict_scores(
+                df_test_final.loc[mask_valid],
+                tokenizers_final[c],
+                models_final[c],
+                c,
+                text_col=text_col,
+                max_len=max_len,
+                batch_size=batch_size,
+                device=device
+            )
+            preds.loc[mask_valid] = pd.Series(y_pred, index=df_test_final.index[mask_valid], dtype="Int64")
+        
+        out_final[f"pred_C{c}"] = preds
+    
+    # Save predictions if path provided
+    if save_csv_path:
+        out_final.to_csv(save_csv_path, index=False)
+        print(f"✓ Final predictions saved to: {save_csv_path}")
+    
+    return out_final
